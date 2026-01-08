@@ -1,0 +1,8 @@
+discord.py
+python-binance
+openai
+python-dotenv
+pandas
+numpy
+google-genai
+Pillow
