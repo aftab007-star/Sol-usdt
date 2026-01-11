@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -22,6 +22,12 @@ client = OpenAI(
 PROMPT = (
     "Analyze these Solana headlines. If they are mostly positive, return BULLISH. "
     "If they warn of hacks or crashes, return BEARISH. "
+    "Respond ONLY as JSON in this form: "
+    "{'verdict': 'BULLISH' or 'BEARISH' or 'NEUTRAL', 'confidence': 1-10, 'reason': 'short note'}"
+)
+TEXT_PROMPT = (
+    "Analyze this Solana news summary. If it is mostly positive, return BULLISH. "
+    "If it warns of hacks, exploits, or crashes, return BEARISH. "
     "Respond ONLY as JSON in this form: "
     "{'verdict': 'BULLISH' or 'BEARISH' or 'NEUTRAL', 'confidence': 1-10, 'reason': 'short note'}"
 )
@@ -51,6 +57,31 @@ def analyze_sentiment(news_list: List[Dict[str, object]]) -> Dict[str, object]:
         result["confidence"] = 9
     if "reason" not in result:
         result["reason"] = "Mocked bullish scenario"
+    result["confidence"] = _normalize_confidence(result.get("confidence"))
+    return result
+
+
+def analyze_text_sentiment(text: str) -> Dict[str, object]:
+    """Send a text blob to Gemini and return verdict + confidence."""
+    if not text:
+        return {"verdict": "NEUTRAL", "confidence": None, "reason": "No text provided"}
+
+    prompt = TEXT_PROMPT + "\n\nText:\n" + text
+    try:
+        response = client.responses.create(model="gemini-1.5-flash", input=prompt)
+        raw_text = _extract_text(response)
+        result = json.loads(raw_text.replace("'", '"'))
+    except Exception:
+        result = {"verdict": "NEUTRAL", "confidence": None, "reason": "Failed to analyze text"}
+
+    if "verdict" not in result:
+        result["verdict"] = "NEUTRAL"
+    if "confidence" not in result:
+        result["confidence"] = None
+    if "reason" not in result:
+        result["reason"] = "No reason provided"
+
+    result["confidence"] = _normalize_confidence(result.get("confidence"))
     return result
 
 
@@ -64,6 +95,22 @@ def _extract_text(response) -> str:
         return str(parts).strip()
     except Exception:
         return str(response)
+
+
+def _normalize_confidence(raw: Optional[object]) -> Optional[float]:
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value > 1.0:
+        value = value / 10.0
+    if value < 0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return value
 
 
 def check_market_gravity(btc_price: float, btc_trend: str) -> bool:

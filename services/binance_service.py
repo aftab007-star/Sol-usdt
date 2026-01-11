@@ -1,4 +1,5 @@
 import os
+from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 import logging
 from pathlib import Path
@@ -35,6 +36,19 @@ if not API_SECRET:
 TRADE_AMOUNT_USDT_ENV = os.getenv("TRADE_AMOUNT_USDT")
 
 
+def get_trade_mode() -> str:
+    """Return normalized trade mode: 'paper' or 'live'."""
+    raw_mode = (os.getenv("TRADE_MODE") or "paper").strip().lower()
+    if raw_mode not in {"paper", "live"}:
+        return "paper"
+    return raw_mode
+
+
+def get_trade_amount(amount_usdt: Optional[float] = None) -> float:
+    """Expose resolved trade amount for other services."""
+    return _get_trade_amount(amount_usdt)
+
+
 def _init_client() -> Client:
     logger.info("Initializing Binance client")
     client = Client(
@@ -45,6 +59,24 @@ def _init_client() -> Client:
     )
     logger.info("Binance client initialized")
     return client
+
+
+def _get_symbol_filters(symbol: str) -> dict:
+    client = get_client()
+    info = client.get_symbol_info(symbol)
+    if not info or "filters" not in info:
+        raise RuntimeError(f"Symbol info unavailable for {symbol}")
+    filters = {f.get("filterType"): f for f in info.get("filters", []) if isinstance(f, dict)}
+    return filters
+
+
+def _round_to_step(value: float, step: float) -> float:
+    if step <= 0:
+        return value
+    d_value = Decimal(str(value))
+    d_step = Decimal(str(step))
+    rounded = (d_value / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step
+    return float(rounded)
 
 
 _client: Optional[Client] = None
@@ -268,14 +300,30 @@ def place_oco_order(
     Note: quantity must be base asset quantity (not quote).
     """
     client = get_client()
+    filters = _get_symbol_filters(symbol)
+    lot_size = filters.get("LOT_SIZE", {})
+    price_filter = filters.get("PRICE_FILTER", {})
+
+    step_size = float(lot_size.get("stepSize") or 0)
+    min_qty = float(lot_size.get("minQty") or 0)
+    tick_size = float(price_filter.get("tickSize") or 0)
+
+    rounded_qty = _round_to_step(quantity, step_size) if step_size else quantity
+    rounded_tp = _round_to_step(take_profit_price, tick_size) if tick_size else take_profit_price
+    rounded_stop = _round_to_step(stop_price, tick_size) if tick_size else stop_price
+    rounded_stop_limit = _round_to_step(stop_limit_price, tick_size) if tick_size else stop_limit_price
+
+    if min_qty and rounded_qty < min_qty:
+        raise ValueError(f"Quantity {rounded_qty} below minQty {min_qty} for {symbol}")
+
     try:
         order = client.create_oco_order(
             symbol=symbol,
             side=Client.SIDE_SELL,
-            quantity=quantity,
-            price=str(round(take_profit_price, 4)),
-            stopPrice=str(round(stop_price, 4)),
-            stopLimitPrice=str(round(stop_limit_price, 4)),
+            quantity=rounded_qty,
+            price=str(rounded_tp),
+            stopPrice=str(rounded_stop),
+            stopLimitPrice=str(rounded_stop_limit),
             stopLimitTimeInForce=Client.TIME_IN_FORCE_GTC,
         )
         logger.info("OCO order placed: orderListId=%s", order.get("orderListId"))

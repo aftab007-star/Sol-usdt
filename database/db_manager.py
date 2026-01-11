@@ -30,6 +30,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     columns = [col[1] for col in cursor.fetchall()]
     if "fundamental_context" not in columns:
         conn.execute("ALTER TABLE trades ADD COLUMN fundamental_context TEXT")
+    if "pnl" not in columns:
+        conn.execute("ALTER TABLE trades ADD COLUMN pnl REAL")
+    if "pnl_pct" not in columns:
+        conn.execute("ALTER TABLE trades ADD COLUMN pnl_pct REAL")
+    if "closed_price" not in columns:
+        conn.execute("ALTER TABLE trades ADD COLUMN closed_price REAL")
+    if "closed_at" not in columns:
+        conn.execute("ALTER TABLE trades ADD COLUMN closed_at TEXT")
 
     # Trade details table for periodic snapshots
     conn.execute(
@@ -56,6 +64,16 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    cursor = conn.execute("PRAGMA table_info(sentiment_store)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "source" not in columns:
+        conn.execute("ALTER TABLE sentiment_store ADD COLUMN source TEXT")
+    if "raw_text" not in columns:
+        conn.execute("ALTER TABLE sentiment_store ADD COLUMN raw_text TEXT")
+    if "channel_id" not in columns:
+        conn.execute("ALTER TABLE sentiment_store ADD COLUMN channel_id TEXT")
+    if "author" not in columns:
+        conn.execute("ALTER TABLE sentiment_store ADD COLUMN author TEXT")
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -107,6 +125,86 @@ def update_trade_status(trade_id: int, status: str) -> None:
         conn.commit()
 
 
+def close_trade(trade_id: int, status: str, pnl: float) -> None:
+    """Update trade status and persist pnl."""
+    with _get_connection() as conn:
+        conn.execute(
+            "UPDATE trades SET status = ?, pnl = ? WHERE id = ?",
+            (status, pnl, trade_id),
+        )
+        conn.commit()
+
+
+def close_trade_with_details(
+    trade_id: int,
+    status: str,
+    pnl_usdt: float,
+    pnl_pct: float,
+    closed_price: float,
+    closed_at: str,
+) -> None:
+    """Update trade status and persist pnl/close details."""
+    with _get_connection() as conn:
+        conn.execute(
+            "UPDATE trades SET status = ?, pnl = ?, pnl_pct = ?, closed_price = ?, closed_at = ? WHERE id = ?",
+            (status, pnl_usdt, pnl_pct, closed_price, closed_at, trade_id),
+        )
+        conn.commit()
+
+
+def get_open_trades() -> list[tuple]:
+    """Return trades considered open for paper tracking."""
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            "SELECT id, pair, signal_type, price, status FROM trades "
+            "WHERE status = 'OPEN'"
+        )
+        return cursor.fetchall()
+
+
+def get_trade_metadata(trade_id: int) -> Optional[tuple]:
+    """Return (timestamp, pair) for a trade id if available."""
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            "SELECT timestamp, pair FROM trades WHERE id = ?",
+            (trade_id,),
+        )
+        row = cursor.fetchone()
+    return (row[0], row[1]) if row else None
+
+
+def get_trades_count_today() -> int:
+    """Return count of BUY trades created today (UTC)."""
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            "SELECT COUNT(*) FROM trades WHERE signal_type = 'BUY' AND substr(timestamp, 1, 10) = date('now')"
+        )
+        row = cursor.fetchone()
+        return int(row[0]) if row else 0
+
+
+def get_realized_pnl_today_usdt() -> float:
+    """Return realized PnL for today from closed trades (UTC)."""
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+            "WHERE status IN ('CLOSED_TP', 'CLOSED_SL') AND "
+            "closed_at IS NOT NULL AND substr(closed_at, 1, 10) = date('now')"
+        )
+        row = cursor.fetchone()
+        return float(row[0]) if row else 0.0
+
+
+def get_last_buy_timestamp() -> Optional[str]:
+    """Return ISO timestamp string for the most recent BUY."""
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            "SELECT timestamp FROM trades WHERE signal_type = 'BUY' ORDER BY id DESC LIMIT 1"
+        )
+        row = cursor.fetchone()
+        return str(row[0]) if row else None
+
+
 def log_trade_detail(trade_id: int, rsi: Optional[float], price: Optional[float], screenshot_filename: Optional[str]) -> None:
     """Store periodic trade detail snapshot."""
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -123,16 +221,47 @@ def log_trade_detail(trade_id: int, rsi: Optional[float], price: Optional[float]
 
 def log_sentiment(verdict: str, confidence: float) -> None:
     """Log the sentiment analysis verdict and confidence."""
+    store_text_sentiment(
+        raw_text=None,
+        verdict=verdict,
+        confidence=confidence,
+        source="image",
+        channel_id=None,
+        author=None,
+    )
+
+
+def store_text_sentiment(
+    raw_text: Optional[str],
+    verdict: str,
+    confidence: Optional[float],
+    source: str = "text",
+    channel_id: Optional[str] = None,
+    author: Optional[str] = None,
+) -> None:
+    """Store a sentiment record with optional source metadata."""
     timestamp = datetime.now(timezone.utc).isoformat()
     with _get_connection() as conn:
         conn.execute(
             """
-            INSERT INTO sentiment_store (timestamp, verdict, confidence)
-            VALUES (?, ?, ?)
+            INSERT INTO sentiment_store (timestamp, verdict, confidence, source, raw_text, channel_id, author)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (timestamp, verdict, confidence),
+            (timestamp, verdict, confidence, source, raw_text, channel_id, author),
         )
         conn.commit()
+
+
+def get_latest_sentiment() -> Optional[dict]:
+    """Return the most recent stored sentiment record, if any."""
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            "SELECT timestamp, verdict, confidence, source FROM sentiment_store ORDER BY id DESC LIMIT 1"
+        )
+        row = cursor.fetchone()
+    if not row:
+        return None
+    return {"timestamp": row[0], "verdict": row[1], "confidence": row[2], "source": row[3]}
 
 
 def get_sentiment_summary(hours: int = 24) -> dict:
@@ -173,4 +302,3 @@ def get_sentiment_summary(hours: int = 24) -> dict:
             )
 
     return summary
-
