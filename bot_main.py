@@ -1,14 +1,28 @@
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 import discord  # THIS MUST BE LINE 1
 from discord.ext import commands
 import datetime
 import os
 from dotenv import load_dotenv
+#from services.scheduler import start_scheduler
+from services.candle_scheduler import (
+    run_on_close,
+    next_4h_close,
+    next_daily_close,
+    next_weekly_close,
+    next_monthly_close,
+)
+
 
 # Initialize Intents AFTER the import
 intents = discord.Intents.default()
 intents.message_content = True  # Required for the bot to read your commands
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+#start_scheduler()
 import datetime
 import json
 import logging
@@ -24,6 +38,7 @@ from dotenv import load_dotenv
 
 from database import db_manager
 from services import binance_service, gemini_service, vision_service
+from services.trade_session_vault import TradeSessionVault
 from services.trade_vault import TradeVault
 from services.news_service import NewsService
 from services.report_service import ReportService
@@ -74,6 +89,9 @@ binance_client = binance_service.get_client()
 report_service = ReportService(binance_client)
 news_service = NewsService()
 trade_vault = TradeVault()
+trade_session_vault = TradeSessionVault()
+PAIR = "SOL/USDT"
+SYMBOL = "SOLUSDT"
 CHANNEL_ID_INT = int(DISCORD_CHANNEL_ID)
 FOUR_HOURS_IN_SECONDS = 4 * 60 * 60
 DEFAULT_SENTIMENT = {"verdict": "NEUTRAL", "confidence": None}
@@ -83,6 +101,19 @@ KILL_SWITCH_OVERRIDE: Optional[bool] = None
 TRADING_HALTED: bool = False
 NEWS_SENTIMENT_CACHE: dict = {"timestamp": 0.0, "sentiment": dict(DEFAULT_SENTIMENT), "headlines": []}
 LAST_TRADE_UPDATE: dict = {"timestamp": 0.0, "trade_id": None}
+
+
+def normalize_pair(pair: str) -> str:
+    p = (pair or "").upper().replace("-", "/").replace("_", "/")
+    if p in {"SOLBTC", "SOL/BTC"}:
+        return PAIR
+    if p in {"SOLUSDT", "SOL/USDT"}:
+        return PAIR
+    return PAIR
+
+
+def pair_to_symbol(pair: str) -> str:
+    return normalize_pair(pair).replace("/", "")
 
 
 def _get_trade_mode() -> str:
@@ -910,7 +941,7 @@ async def _maybe_send_trade_update(channel: discord.abc.Messageable) -> None:
     if last_trade_id == trade_id and (now - last_ts) < interval_seconds:
         return
 
-    symbol = str(pair).replace("/", "")
+    symbol = pair_to_symbol(pair)
     price = binance_service.get_live_price(symbol)
     indicators = binance_service.get_indicators(symbol)
     rsi = indicators.get("rsi")
@@ -982,6 +1013,9 @@ async def monitor_market():
         sol_price = binance_service.get_live_price("SOLUSDT")
         sol_indicators = binance_service.get_indicators("SOLUSDT")
         sol_rsi = sol_indicators.get("rsi")
+        technical_report = (
+            dict(sol_indicators) if isinstance(sol_indicators, dict) else {"rsi": sol_rsi}
+        )
 
         btc_price = binance_service.get_live_price("BTCUSDT")
         btc_indicators = binance_service.get_indicators("BTCUSDT")
@@ -1023,24 +1057,23 @@ async def monitor_market():
                 if title:
                     output_logger.info("[NEWS] %s", title)
 
-        # Safety Logic: Skip signal if risk is high
         if fundamental_sentiment == "BEARISH":
-            logger.info("Skipping signal generation due to HIGH risk (BEARISH fundamental sentiment).")
-            return
+            logger.info(
+                "Fundamental sentiment BEARISH; continuing with TA-only signal generation."
+            )
 
         if verdict == "BEARISH" and _block_on_bearish():
             confidence = sentiment.get("confidence")
             conf_value = float(confidence) if confidence is not None else 0.0
             if conf_value >= _sentiment_min_confidence():
                 reason = (
-                    f"Blocking BUY: news sentiment BEARISH (confidence {conf_value:.2f} >= "
-                    f"{_sentiment_min_confidence():.2f})."
+                    f"WARNING: news sentiment BEARISH (confidence {conf_value:.2f} >= "
+                    f"{_sentiment_min_confidence():.2f}). TA signal will still be allowed."
                 )
                 logger.info(reason)
                 await channel.send(reason)
-                return
 
-        if sol_rsi is not None and sol_rsi < 35 and verdict == "BULLISH":
+        if sol_rsi is not None and sol_rsi < 35:
             price = sol_price or 0
             target_profit = price * 1.014
             stop_loss = price * 0.98
@@ -1048,8 +1081,7 @@ async def monitor_market():
             signal_message = (
                 f"**Potential BUY Signal for SOL/USDT**\n\n"
                 f"**RSI:** {sol_rsi:.2f}\n"
-                f"**News Sentiment:** {verdict}\n"
-                f"**Fundamental Risk:** {fundamental_sentiment}\n\n"
+                f"**FA Context / Warning:** News {verdict} | Fundamentals {fundamental_sentiment}\n\n"
                 f"**Current Price:** ${price:.4f}\n"
                 f"**Target Profit:** `${target_profit:.4f}` (+1.4%)\n"
                 f"**Stop Loss:** `${stop_loss:.4f}` (-2.0%)\n\n"
@@ -1058,6 +1090,17 @@ async def monitor_market():
 
             view = SignalView("SOL/USDT", price, fundamental_context=vision_data)
             await channel.send(signal_message, view=view)
+            trade_session_vault.append_event(
+                PAIR,
+                event_type="TA_SIGNAL",
+                ta=technical_report,
+                fa={
+                    "news_sentiment": sentiment,
+                    "fundamental_sentiment": fundamental_sentiment,
+                    "vision_data": vision_data,
+                },
+                extra={"price": sol_price},
+            )
 
     except Exception:
         logger.exception("Error in monitor_market loop")
@@ -1071,11 +1114,18 @@ async def before_monitor():
 
 @bot.event
 async def on_ready():
+    asyncio.create_task(run_on_close("4H Report", next_4h_close, report_4h_combo_report))
+    asyncio.create_task(run_on_close("Daily Report", next_daily_close, daily_combo_report))
+    asyncio.create_task(run_on_close("Weekly Report", next_weekly_close, weekly_combo_report))
+    asyncio.create_task(run_on_close("Monthly Report", next_monthly_close, monthly_combo_report))
+
     logger.info("Bot logged in as %s", bot.user)
     if not monitor_market.is_running():
         monitor_market.start()
-    if not daily_combo_report.is_running():
+    #if not daily_combo_report.is_running():
         daily_combo_report.start()
+    #if not report_4h_combo_report.is_running():
+        report_4h_combo_report.start()
     if not track_paper_trades.is_running():
         track_paper_trades.start()
     try:
@@ -1352,7 +1402,7 @@ async def open_trades(ctx):
     for trade_id, pair, signal_type, entry_price, status in open_trades:
         if not entry_price:
             continue
-        symbol = str(pair).replace("/", "")
+        symbol = pair_to_symbol(pair)
         current_price = binance_service.get_live_price(symbol)
         tp_price = float(entry_price) * 1.02
         sl_price = float(entry_price) * 0.99
@@ -1447,7 +1497,7 @@ async def track_paper_trades():
             continue
         if not entry_price:
             continue
-        symbol = str(pair).replace("/", "")
+        symbol = pair_to_symbol(pair)
         current_price = binance_service.get_live_price(symbol)
         if current_price is None:
             continue
@@ -1538,6 +1588,18 @@ async def track_paper_trades():
                 "final_sentiment": final_sentiment,
             }
             trade_vault.finalize_trade(trade_folder, summary_payload)
+            trade_session_vault.close_active_session(
+                pair,
+                reason,
+                {
+                    "trade_id": trade_id,
+                    "close_status": close_status,
+                    "closed_at": closed_at,
+                    "pnl_usdt": pnl_usdt,
+                    "pnl_pct": pnl_pct,
+                    "price": float(close_price),
+                },
+            )
         except Exception:
             logger.exception("Failed to close trade_id=%s", trade_id)
 
@@ -1592,6 +1654,172 @@ async def daily_combo_report():
     except Exception as e:
         logger.exception("Failed to generate daily combo report")
         await channel.send(f"Error generating daily report: {e}")
+
+
+@tasks.loop(hours=4)
+async def report_4h_combo_report():
+    channel = bot.get_channel(CHANNEL_ID_INT)
+    if channel is None:
+        channel = await bot.fetch_channel(CHANNEL_ID_INT)
+
+    try:
+        technical_report = report_service.generate_technical_report(timeframe="4h")
+        try:
+            sentiment_summary = db_manager.get_sentiment_summary(hours=4)
+        except Exception:
+            logger.exception("Failed to load 4H sentiment summary")
+            sentiment_summary = {"total": 0}
+
+        embed = discord.Embed(
+            title=f"4H Combo Report for {PAIR}",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+
+        embed.add_field(
+            name="📊 Technical Analysis (4H)",
+            value=(
+                f"**Price:** ${technical_report['Current_Price']:.4f}\n"
+                f"**RSI:** {technical_report['RSI']:.2f}\n"
+                f"**SMA 50/200:** ${technical_report['SMA_50']:.2f} / ${technical_report['SMA_200']:.2f}\n"
+                f"**MACD:** {technical_report['MACD']:.2f} (Signal: {technical_report['MACD_Signal']:.2f})\n"
+                f"**Pattern:** {technical_report['Candlestick_Pattern']}"
+            ),
+            inline=False,
+        )
+
+        total_sentiments = sentiment_summary["total"]
+        if total_sentiments > 0:
+            bull_perc = (sentiment_summary["BULLISH"]["count"] / total_sentiments) * 100
+            bear_perc = (sentiment_summary["BEARISH"]["count"] / total_sentiments) * 100
+            neut_perc = (sentiment_summary["NEUTRAL"]["count"] / total_sentiments) * 100
+            embed.add_field(
+                name="📰 Sentiment Analysis (4h)",
+                value=(
+                    f"**Bullish:** {bull_perc:.1f}% "
+                    f"(Avg. Conf: {sentiment_summary['BULLISH']['confidence']:.1f}%)\n"
+                    f"**Bearish:** {bear_perc:.1f}% "
+                    f"(Avg. Conf: {sentiment_summary['BEARISH']['confidence']:.1f}%)\n"
+                    f"**Neutral:** {neut_perc:.1f}% "
+                    f"(Avg. Conf: {sentiment_summary['NEUTRAL']['confidence']:.1f}%)\n"
+                    f"({total_sentiments} total analyses)"
+                ),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="📰 Sentiment Analysis (4h)",
+                value="No fundamentals received in the last 4 hours. (Technical-only report)",
+                inline=False,
+            )
+
+        await channel.send(embed=embed)
+    except Exception as e:
+        logger.exception("Failed to generate 4H combo report")
+        await channel.send(f"Error generating 4H report: {e}")
+
+
+async def _send_timeframe_report_to_channel(timeframe: str) -> None:
+    channel = bot.get_channel(CHANNEL_ID_INT)
+    if channel is None:
+        channel = await bot.fetch_channel(CHANNEL_ID_INT)
+
+    timeframe_map = {
+        "daily": "1d",
+        "weekly": "1w",
+        "monthly": "1M",
+    }
+    if timeframe not in timeframe_map:
+        logger.error("Invalid timeframe for scheduled report: %s", timeframe)
+        return
+
+    try:
+        technical_report = report_service.generate_technical_report(
+            timeframe=timeframe_map[timeframe]
+        )
+        sentiment_summary = db_manager.get_sentiment_summary(hours=24)
+
+        score = 0
+        if technical_report["RSI"] < 30:
+            score += 2
+        elif technical_report["RSI"] < 40:
+            score += 1
+        elif technical_report["RSI"] > 70:
+            score -= 2
+        elif technical_report["RSI"] > 60:
+            score -= 1
+        if technical_report["MACD"] > technical_report["MACD_Signal"]:
+            score += 1
+        else:
+            score -= 1
+        if sentiment_summary["total"] > 0:
+            if sentiment_summary["BULLISH"]["count"] > sentiment_summary["BEARISH"]["count"]:
+                score += 1
+            elif sentiment_summary["BEARISH"]["count"] > sentiment_summary["BULLISH"]["count"]:
+                score -= 1
+
+        if score >= 3:
+            recommendation = "🟢 Strong Buy Signal"
+        elif score >= 1:
+            recommendation = "🟩 Leaning Bullish"
+        elif score <= -3:
+            recommendation = "🔴 Strong Sell Signal"
+        elif score <= -1:
+            recommendation = "🟥 Leaning Bearish"
+        else:
+            recommendation = "🟡 Neutral / Hold"
+
+        embed = discord.Embed(
+            title=f"{timeframe.capitalize()} Report for SOL/USDT",
+            color=discord.Color.purple(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+
+        embed.add_field(
+            name="📊 Technical Analysis",
+            value=(
+                f"**Price:** ${technical_report['Current_Price']:.4f}\n"
+                f"**RSI:** {technical_report['RSI']:.2f}\n"
+                f"**SMA 50/200:** ${technical_report['SMA_50']:.2f} / "
+                f"${technical_report['SMA_200']:.2f}\n"
+                f"**MACD:** {technical_report['MACD']:.2f} "
+                f"(Signal: {technical_report['MACD_Signal']:.2f})\n"
+                f"**Pattern:** {technical_report['Candlestick_Pattern']}"
+            ),
+            inline=False,
+        )
+
+        total_sentiments = sentiment_summary["total"]
+        if total_sentiments > 0:
+            bull_perc = (sentiment_summary["BULLISH"]["count"] / total_sentiments) * 100
+            bear_perc = (sentiment_summary["BEARISH"]["count"] / total_sentiments) * 100
+            embed.add_field(
+                name="📰 Sentiment Analysis (24h)",
+                value=(
+                    f"**Bullish:** {bull_perc:.1f}%\n"
+                    f"**Bearish:** {bear_perc:.1f}%"
+                ),
+                inline=True,
+            )
+
+        embed.add_field(
+            name="🧠 Recommendation",
+            value=f"**{recommendation}** (Score: {score})",
+            inline=True,
+        )
+
+        await channel.send(embed=embed)
+    except Exception as e:
+        logger.exception("Failed to generate %s report", timeframe)
+        await channel.send(f"Error generating report: {e}")
+
+
+async def weekly_combo_report():
+    await _send_timeframe_report_to_channel("weekly")
+
+
+async def monthly_combo_report():
+    await _send_timeframe_report_to_channel("monthly")
 
 
 @bot.command(name="report")

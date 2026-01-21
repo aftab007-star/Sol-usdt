@@ -282,6 +282,7 @@ def get_sentiment_summary(hours: int = 24) -> dict:
         "NEUTRAL": {"count": 0, "confidence": 0.0},
         "total": 0,
     }
+    allowed_verdicts = {"BULLISH", "BEARISH", "NEUTRAL"}
     confidence_sums = {
         "BULLISH": 0.0,
         "BEARISH": 0.0,
@@ -289,16 +290,19 @@ def get_sentiment_summary(hours: int = 24) -> dict:
     }
 
     for verdict, confidence in rows:
-        verdict = verdict.upper()
-        if verdict in summary:
-            summary[verdict]["count"] += 1
-            confidence_sums[verdict] += confidence
-            summary["total"] += 1
+        verdict = (verdict or "NEUTRAL").upper()
+        confidence = float(confidence) if confidence is not None else 0.0
+        if verdict not in allowed_verdicts:
+            verdict = "NEUTRAL"
+        summary[verdict]["count"] += 1
+        confidence_sums[verdict] += confidence
+        summary["total"] += 1
 
     for verdict in ["BULLISH", "BEARISH", "NEUTRAL"]:
-        if summary[verdict]["count"] > 0:
-            summary[verdict]["confidence"] = (
-                confidence_sums[verdict] / summary[verdict]["count"]
-            )
+        count = summary[verdict]["count"]
+        if count > 0:
+            summary[verdict]["confidence"] = confidence_sums[verdict] / count
+        else:
+            summary[verdict]["confidence"] = 0.0
 
     return summary
